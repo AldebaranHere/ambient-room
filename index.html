@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ambient Room</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #111; color: #fff;
+    font-family: system-ui, sans-serif; overflow: hidden; }
+  #glow { position: fixed; inset: 0; transition: background-color 1.5s linear; }
+  #setup { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; background: #111; z-index: 2; }
+  .card { background: #1d1d1d; padding: 24px 28px; border-radius: 12px; max-width: 420px; width: 90%; }
+  .card h1 { margin: 0 0 4px; font-size: 22px; }
+  .card p { color: #aaa; font-size: 14px; margin: 0 0 16px; }
+  label { display: block; font-size: 14px; margin: 12px 0 4px; }
+  input { width: 100%; box-sizing: border-box; padding: 8px; font-size: 16px; border-radius: 6px; border: 1px solid #444; background: #000; color: #fff; }
+  button { margin-top: 18px; width: 100%; padding: 12px; font-size: 16px; border: 0; border-radius: 8px; background: #2fa84f; color: #fff; cursor: pointer; }
+  #info { position: fixed; left: 16px; bottom: 12px; font-size: 14px; color: rgba(255,255,255,.75); z-index: 1; text-shadow: 0 0 4px #000; display: none; white-space: pre; }
+  #summary { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; background: rgba(0,0,0,.85); z-index: 3; }
+  .keys { font-size: 12px; color: #888; margin-top: 14px; line-height: 1.6; }
+</style>
+</head>
+<body>
+<div id="glow"></div>
+<div id="info"></div>
+
+<div id="setup">
+  <div class="card">
+    <h1>Ambient Room</h1>
+    <p>The screen glows green, then amber, then red as the meeting uses energy. After the planned time, the glow pulses and dims.</p>
+    <label>Session label (e.g. G1-meeting1-ambient)</label>
+    <input id="label" value="G1-meeting1">
+    <label>Planned meeting length (minutes)</label>
+    <input id="mins" type="number" min="1" step="0.5" value="10">
+    <label>Room power in watts (heater + lights)</label>
+    <input id="watts" type="number" min="1" value="2100">
+    <label style="display:flex;gap:8px;align-items:center"><input id="usemic" type="checkbox" checked style="width:auto"> Use microphone (clap twice = 2 more minutes)</label>
+    <button id="go">Start meeting (full screen)</button>
+    <div class="keys">
+      Researcher keys (Wizard of Oz):<br>
+      Space = pause / resume · T = show/hide energy text<br>
+      M = mark an event in the log · S = sound on/off<br>
+      + / − = add / remove 1 minute of planned time<br>
+      [ / ] = clap detection less / more sensitive<br>
+      E = end the meeting and download the log (CSV)
+    </div>
+  </div>
+</div>
+
+<div id="summary"><div class="card" id="sumcard"></div></div>
+
+<script>
+const KETTLE_WH = 100;            // one kettle boil is about 100 Wh
+const $ = id => document.getElementById(id);
+let planned = 600, watts = 2100, label = "";
+let startMs = 0, pausedMs = 0, pauseStart = 0, paused = false, running = false;
+let soundOn = true, warned80 = false, warned100 = false, showText = false;
+const log = [];
+
+function elapsed() {
+  const now = paused ? pauseStart : performance.now();
+  return (now - startMs - pausedMs) / 1000;
+}
+function addLog(event) {
+  log.push({ time: new Date().toISOString(), elapsed_s: elapsed().toFixed(1), event });
+}
+function chime(freq) {
+  if (!soundOn) return;
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const o = ctx.createOscillator(), g = ctx.createGain();
+    o.frequency.value = freq; o.type = "sine";
+    g.gain.setValueAtTime(0.0001, ctx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.25, ctx.currentTime + 0.1);
+    g.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 1.8);
+    o.connect(g); g.connect(ctx.destination); o.start(); o.stop(ctx.currentTime + 1.9);
+  } catch (e) {}
+}
+
+// colour from fraction of planned time used
+function colourFor(f, t) {
+  let hue, light = 45;
+  if (f < 0.7)      hue = 140 - (f / 0.7) * 40;          // green -> yellow-green
+  else if (f < 1.0) hue = 100 - ((f - 0.7) / 0.3) * 65;  // -> amber
+  else {
+    const over = Math.min((f - 1) / 0.5, 1);             // overtime, 0..1 over half the planned time
+    hue = 35 - over * 35;                                 // amber -> red
+    light = 45 - over * 30;                               // the room "dims"
+    light += Math.sin(t * 2) * 6 * (0.3 + over);          // slow pulse
+  }
+  return `hsl(${hue.toFixed(0)}, 85%, ${Math.max(light, 8).toFixed(0)}%)`;
+}
+
+// ---------- microphone: double clap = +2 min, quiet-room detection ----------
+let analyser = null, micBuf = null, micOn = false;
+let clapThreshold = 0.45;          // peak amplitude (0..1) that counts as a clap
+let baseline = 0.02, lastPeakMs = 0, firstClapMs = 0;
+let quietSinceMs = 0, quietLogged = false, level = 0;
+let candidateMs = 0, prevPeak = 0, cooldownUntil = 0, pendingDoubleMs = 0;
+
+async function startMic() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    analyser = ctx.createAnalyser(); analyser.fftSize = 1024;
+    ctx.createMediaStreamSource(stream).connect(analyser);
+    micBuf = new Float32Array(analyser.fftSize);
+    micOn = true; addLog("microphone on");
+  } catch (e) { micOn = false; addLog("microphone blocked: " + e.name); }
+}
+
+function flash() {
+  const f = document.createElement("div");
+  f.style.cssText = "position:fixed;inset:0;background:#fff;opacity:.8;transition:opacity .6s;z-index:1";
+  document.body.appendChild(f);
+  requestAnimationFrame(() => { f.style.opacity = "0"; });
+  setTimeout(() => f.remove(), 700);
+}
+
+function readMic() {
+  if (!micOn || paused) return;
+  analyser.getFloatTimeDomainData(micBuf);
+  let peak = 0, sum = 0;
+  for (const v of micBuf) { const a = Math.abs(v); if (a > peak) peak = a; sum += v * v; }
+  level = Math.sqrt(sum / micBuf.length);
+  baseline = baseline * 0.995 + level * 0.005;           // slow average of room noise
+  const now = performance.now();
+  // A clap is a sharp onset that dies away fast. Speech, laughter and tones last longer.
+  // Step 1: candidate = sudden jump from a low level to above the threshold.
+  if (!candidateMs && peak > clapThreshold && prevPeak < clapThreshold * 0.4 &&
+      peak > baseline * 8 && now - lastPeakMs > 150 && now > cooldownUntil) {
+    candidateMs = now;
+    if (pendingDoubleMs) { pendingDoubleMs = 0; firstClapMs = 0; }   // a 3rd sharp sound: laughter or knocking, not a double clap
+  }
+  // Step 2: 90 ms after the onset, the sound must already be gone.
+  if (candidateMs && now - candidateMs >= 90) {
+    const shortSound = peak < clapThreshold * 0.35;
+    lastPeakMs = candidateMs; candidateMs = 0;
+    if (shortSound) {
+      if (firstClapMs && lastPeakMs - firstClapMs > 200 && lastPeakMs - firstClapMs < 800) {
+        pendingDoubleMs = lastPeakMs; firstClapMs = 0;
+      } else firstClapMs = lastPeakMs;
+    }
+  }
+  // Step 3: accept the double clap only if no 3rd sharp sound follows within 400 ms.
+  if (pendingDoubleMs && now - pendingDoubleMs > 400) {
+    pendingDoubleMs = 0; cooldownUntil = now + 4000;
+    planned += 120; addLog("double clap: planned +2 min"); flash(); chime(440);
+  }
+  prevPeak = peak;
+  if (firstClapMs && now - firstClapMs > 800) firstClapMs = 0;
+  // quiet room: talk level near the background for 10 s
+  if (level < Math.max(baseline * 1.5, 0.01)) {
+    if (!quietSinceMs) quietSinceMs = now;
+    if (!quietLogged && now - quietSinceMs > 10000) { quietLogged = true; addLog("room quiet for 10 s"); }
+  } else {
+    if (quietLogged) addLog("talk resumed");
+    quietSinceMs = 0; quietLogged = false;
+  }
+}
+
+function fmt(s) { s = Math.max(0, Math.round(s)); return `${Math.floor(s/60)}:${String(s%60).padStart(2,"0")}`; }
+
+function tick() {
+  if (!running) return;
+  readMic();
+  const e = elapsed(), f = e / planned;
+  $("glow").style.backgroundColor = colourFor(f, performance.now() / 1000);
+  if (!warned80 && f >= 0.8) { warned80 = true; chime(520); addLog("auto: 80% wrap-up chime"); }
+  if (!warned100 && f >= 1.0) { warned100 = true; chime(660); setTimeout(() => chime(660), 400); addLog("auto: planned time reached"); }
+  const wh = watts * e / 3600;
+  $("info").textContent =
+    `${fmt(e)} / ${fmt(planned)}${e > planned ? "   overtime " + fmt(e - planned) : ""}${paused ? "   (paused)" : ""}\n` +
+    `energy used: ${(wh/1000).toFixed(3)} kWh = ${(wh/KETTLE_WH).toFixed(1)} kettle boils\n` +
+    (micOn ? `mic level ${level.toFixed(3)} · clap threshold ${clapThreshold.toFixed(2)}` : "mic off");
+  requestAnimationFrame(tick);
+}
+
+$("go").onclick = async () => {
+  if ($("usemic").checked) await startMic();
+  label = $("label").value.trim() || "session";
+  planned = Math.max(30, parseFloat($("mins").value) * 60 || 600);
+  watts = parseFloat($("watts").value) || 2100;
+  $("setup").style.display = "none";
+  document.documentElement.requestFullscreen?.().catch(() => {});
+  startMs = performance.now(); running = true;
+  addLog(`start (planned ${planned/60} min, ${watts} W)`);
+  tick();
+};
+
+function endMeeting() {
+  if (!running) return;
+  addLog("end");
+  running = false;
+  const e = elapsed(), over = Math.max(0, e - planned), wh = watts * e / 3600, overWh = watts * over / 3600;
+  const rows = [["session", "time", "elapsed_s", "event"], ...log.map(r => [label, r.time, r.elapsed_s, r.event])];
+  rows.push([label, "", "", `SUMMARY planned_s=${planned} actual_s=${e.toFixed(1)} overrun_s=${over.toFixed(1)} energy_Wh=${wh.toFixed(1)} overrun_Wh=${overWh.toFixed(1)}`]);
+  const csv = rows.map(r => r.map(v => `"${String(v).replace(/"/g, '""')}"`).join(",")).join("\n");
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
+  a.download = `${label}-${new Date().toISOString().slice(0,16).replace(/[:T]/g,"-")}.csv`;
+  a.click();
+  $("sumcard").innerHTML = `<h1>Meeting ended</h1>
+    <p>Planned ${fmt(planned)} · Actual ${fmt(e)} · Overtime ${fmt(over)}</p>
+    <p>Energy used: ${(wh/1000).toFixed(3)} kWh (${(wh/KETTLE_WH).toFixed(1)} kettle boils).<br>
+    Energy in overtime: ${(overWh/1000).toFixed(3)} kWh.</p>
+    <p>The log (CSV) has been downloaded. Reload the page for the next meeting.</p>`;
+  $("summary").style.display = "flex";
+}
+
+document.addEventListener("keydown", ev => {
+  if (!running) return;
+  const k = ev.key.toLowerCase();
+  if (k === " ") {
+    ev.preventDefault();
+    if (!paused) { paused = true; pauseStart = performance.now(); addLog("pause"); }
+    else { pausedMs += performance.now() - pauseStart; paused = false; addLog("resume"); }
+  } else if (k === "t") { showText = !showText; $("info").style.display = showText ? "block" : "none"; }
+  else if (k === "m") { addLog("researcher mark"); }
+  else if (k === "s") { soundOn = !soundOn; addLog("sound " + (soundOn ? "on" : "off")); }
+  else if (k === "+" || k === "=") { planned += 60; addLog("planned +1 min"); }
+  else if (k === "-") { planned = Math.max(60, planned - 60); addLog("planned -1 min"); }
+  else if (k === "[") { clapThreshold = Math.min(0.95, clapThreshold + 0.05); }
+  else if (k === "]") { clapThreshold = Math.max(0.10, clapThreshold - 0.05); }
+  else if (k === "e") { endMeeting(); }
+});
+</script>
+</body>
+</html>
